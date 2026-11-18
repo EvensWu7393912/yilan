@@ -22,6 +22,10 @@ struct StatusView: View {
 
             Divider()
 
+            TopAppsBoard()
+
+            Divider()
+
             VStack(alignment: .leading, spacing: 10) {
                 Text("网络").font(.headline)
                 HStack(spacing: 10) {
@@ -199,31 +203,71 @@ private struct Sparkline: View {
 
 // MARK: - Menu bar label
 
+/// What the status item shows, as plain values. The image is only re-rendered when this changes,
+/// so background samples that round to the same text cost nothing.
+struct MenuBarContent: Equatable {
+    enum PowerKind: Hashable { case charging, plug, draw }
+    enum Cell: Hashable {
+        case symbol(String)
+        case metric(caption: String, value: String, width: CGFloat)
+        case network(up: String, down: String)
+        case power(level: Int, kind: PowerKind, value: String) // level in percent
+        case messages(count: String?)
+    }
+
+    var awake = false
+    var groups: [[Cell]] = []
+
+    @MainActor
+    init(items: Set<MenuBarItem>, symbol: String, stats: SystemStats, ai: AIUsage, awake: Bool, messages: MessageWatcher) {
+        self.awake = awake
+        let layout: [[MenuBarItem]] = [[.messages], [.volume], [.cpu, .memory, .disk], [.network], [.power], [.claude, .codex, .grok]]
+        func limit(_ p: Double?) -> String { p.map { "\(Int($0.rounded()))%" } ?? "—" }
+        func cell(_ item: MenuBarItem) -> Cell? {
+            guard items.contains(item) else { return nil }
+            switch item {
+            case .volume: return .symbol(symbol)
+            case .cpu: return .metric(caption: "CPU", value: percent(stats.cpu), width: 31)
+            case .memory: return .metric(caption: "RAM", value: percent(stats.memoryFraction), width: 31)
+            case .disk: return .metric(caption: "SSD", value: percent(stats.diskFraction), width: 31)
+            case .network: return .network(up: compactRate(stats.upload), down: compactRate(stats.download))
+            case .power:
+                guard let b = stats.battery else { return nil }
+                let level = Int((b.level * 100).rounded())
+                if b.charging, let w = b.batteryWatts, w > 0 {
+                    return .power(level: level, kind: .charging, value: watts(w, compact: true))
+                }
+                if b.onAC, b.systemWatts == nil { return .power(level: level, kind: .plug, value: "") }
+                return .power(level: level, kind: .draw, value: b.systemWatts.map { watts($0, compact: true) } ?? "—")
+            case .claude: return .metric(caption: "CLAUDE", value: limit(ai.claudeCurrentPercent), width: 36)
+            case .codex: return .metric(caption: "CODEX", value: limit(ai.codexCurrentPercent), width: 34)
+            case .grok: return .metric(caption: "GROK", value: limit(ai.grokCurrentPercent), width: 30)
+            case .messages:
+                // Only shown while something is unread.
+                guard messages.totalUnread > 0 || messages.hasUnmarkedBadge else { return nil }
+                return .messages(count: messages.totalUnread > 0 ? (messages.totalUnread > 99 ? "99+" : "\(messages.totalUnread)") : nil)
+            }
+        }
+        groups = layout.map { $0.compactMap(cell) }.filter { !$0.isEmpty }
+        if groups.isEmpty { groups = [[.symbol(symbol)]] } // never leave the status item blank
+    }
+}
+
 /// Menu bar readout: the chosen items, grouped and separated by hairlines.
 private struct MenuBarStatsLabel: View {
-    let items: Set<MenuBarItem>
-    let symbol: String
-    let stats: SystemStats
-    let ai: AIUsage
-    let awake: Bool
-    let messages: MessageWatcher
+    let content: MenuBarContent
 
     var body: some View {
-        let groups: [[MenuBarItem]] = [[.messages], [.volume], [.cpu, .memory, .disk], [.network], [.power], [.claude, .codex, .grok]]
-            .map { $0.filter { items.contains($0) && ($0 != .power || stats.battery != nil)
-                               && ($0 != .messages || messages.totalUnread > 0 || messages.hasUnmarkedBadge) } }
-            .filter { !$0.isEmpty }
         HStack(spacing: 5) {
-            if awake { // keep-awake session indicator, always leftmost
+            if content.awake { // keep-awake session indicator, always leftmost
                 Image(systemName: "cup.and.saucer.fill")
                     .font(.system(size: 11, weight: .medium))
                     .frame(width: 16)
             }
-            ForEach(Array(groups.enumerated()), id: \.offset) { index, group in
+            ForEach(Array(content.groups.enumerated()), id: \.offset) { index, group in
                 if index > 0 { separator }
                 ForEach(group, id: \.self) { cell($0) }
             }
-            if groups.isEmpty { cell(.volume) } // never leave the status item blank
         }
         .foregroundStyle(.black) // rendered as a template image, so the menu bar tints it
         .padding(.horizontal, 1)
@@ -231,43 +275,50 @@ private struct MenuBarStatsLabel: View {
     }
 
     @ViewBuilder
-    private func cell(_ item: MenuBarItem) -> some View {
-        switch item {
-        case .volume:
-            Image(systemName: symbol)
+    private func cell(_ cell: MenuBarContent.Cell) -> some View {
+        switch cell {
+        case .symbol(let name):
+            Image(systemName: name)
                 .font(.system(size: 12, weight: .medium))
                 .frame(width: 17)
-        case .cpu:
-            metric { Text("CPU") } value: { Text(percent(stats.cpu)) }
-        case .memory:
-            metric { Text("RAM") } value: { Text(percent(stats.memoryFraction)) }
-        case .disk:
-            metric { Text("SSD") } value: { Text(percent(stats.diskFraction)) }
-        case .network:
+        case .metric(let caption, let value, let width):
+            metric(width: width) { Text(caption) } value: { Text(value) }
+        case .network(let up, let down):
             VStack(alignment: .leading, spacing: 0) {
-                Text("↑ \(compactRate(stats.upload))")
-                Text("↓ \(compactRate(stats.download))")
+                Text("↑ \(up)")
+                Text("↓ \(down)")
             }
             .font(.system(size: 9, weight: .medium))
             .monospacedDigit()
             .frame(width: 54, alignment: .leading)
-        case .power:
-            if let battery = stats.battery { powerMetric(battery) }
-        case .claude:
-            metric(width: 36) { Text("CLAUDE") } value: { Text(ai.claudeCurrentPercent.map { "\(Int($0.rounded()))%" } ?? "—") }
-        case .messages:
+        case .power(let level, let kind, let value):
+            // Caption is a battery gauge plus level; the value is charge power while charging, otherwise system draw.
+            metric(width: 38) {
+                HStack(spacing: 2) {
+                    MiniBattery(level: Double(level) / 100)
+                    Text("\(level)%")
+                }
+            } value: {
+                HStack(spacing: 0) {
+                    switch kind {
+                    case .charging:
+                        Image(systemName: "bolt.fill").font(.system(size: 8, weight: .bold))
+                        Text(value)
+                    case .plug:
+                        Image(systemName: "powerplug.fill").font(.system(size: 8))
+                    case .draw:
+                        Text(value)
+                    }
+                }
+            }
+        case .messages(let count):
             HStack(spacing: 2) {
                 Image(systemName: "bubble.left.fill").font(.system(size: 11, weight: .medium))
-                if messages.totalUnread > 0 {
-                    Text(messages.totalUnread > 99 ? "99+" : "\(messages.totalUnread)")
-                        .font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                if let count {
+                    Text(count).font(.system(size: 11, weight: .semibold)).monospacedDigit()
                 }
             }
             .fixedSize()
-        case .codex:
-            metric(width: 34) { Text("CODEX") } value: { Text(ai.codexCurrentPercent.map { "\(Int($0.rounded()))%" } ?? "—") }
-        case .grok:
-            metric(width: 30) { Text("GROK") } value: { Text(ai.grokCurrentPercent.map { "\(Int($0.rounded()))%" } ?? "—") }
         }
     }
 
@@ -284,27 +335,6 @@ private struct MenuBarStatsLabel: View {
             value().font(.system(size: 11, weight: .semibold)).monospacedDigit().fixedSize()
         }
         .frame(width: width, alignment: .leading)
-    }
-
-    /// Caption is a battery gauge plus level; the value is charge power while charging, otherwise system draw.
-    private func powerMetric(_ b: BatteryInfo) -> some View {
-        metric(width: 38) {
-            HStack(spacing: 2) {
-                MiniBattery(level: b.level)
-                Text(percent(b.level))
-            }
-        } value: {
-            HStack(spacing: 0) {
-                if b.charging, let w = b.batteryWatts, w > 0 {
-                    Image(systemName: "bolt.fill").font(.system(size: 8, weight: .bold))
-                    Text(watts(w, compact: true))
-                } else if b.onAC, b.systemWatts == nil {
-                    Image(systemName: "powerplug.fill").font(.system(size: 8))
-                } else {
-                    Text(b.systemWatts.map { watts($0, compact: true) } ?? "—")
-                }
-            }
-        }
     }
 }
 
@@ -327,11 +357,9 @@ private struct MiniBattery: View {
 
 /// Status item image: the custom layout rasterized as a template so the menu bar tints it.
 @MainActor
-func menuBarStatsImage(items: Set<MenuBarItem>, symbol: String, stats: SystemStats, ai: AIUsage,
-                       awake: Bool, messages: MessageWatcher) -> NSImage {
-    let renderer = ImageRenderer(content: MenuBarStatsLabel(items: items, symbol: symbol, stats: stats, ai: ai,
-                                                            awake: awake, messages: messages))
-    renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+func menuBarStatsImage(_ content: MenuBarContent, scale: CGFloat) -> NSImage {
+    let renderer = ImageRenderer(content: MenuBarStatsLabel(content: content))
+    renderer.scale = scale
     let image = renderer.nsImage ?? NSImage()
     image.isTemplate = true
     return image

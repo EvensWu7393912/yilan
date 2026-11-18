@@ -4,8 +4,9 @@ import AudioToolbox
 import ServiceManagement
 import UniformTypeIdentifiers
 
+/// Also used by TopApps to count helper processes under their app.
 @_silgen_name("responsibility_get_pid_responsible_for_pid")
-private func responsibility_get_pid_responsible_for_pid(_ pid: pid_t) -> pid_t
+func responsibility_get_pid_responsible_for_pid(_ pid: pid_t) -> pid_t
 
 struct AppSetting: Codable, Equatable {
     var volume: Float = 1
@@ -103,6 +104,7 @@ final class Mixer: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshApps() }
         }
+        timer?.tolerance = 0.1
     }
 
     // MARK: System output
@@ -205,9 +207,14 @@ final class Mixer: ObservableObject {
 
         for app in next.values where app.isPlaying { seen.insert(app.id) }
         groups = next
-        apps = next.values
+        let listed = next.values
             .filter { seen.contains($0.id) || settings[$0.id] != nil }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        // The open popover polls every second; only republish when the list really changed.
+        let unchanged = listed.count == apps.count && zip(listed, apps).allSatisfy {
+            $0.id == $1.id && $0.isPlaying == $1.isPlaying && $0.name == $1.name && $0.processes == $1.processes
+        }
+        if !unchanged { apps = listed }
         syncTaps()
     }
 

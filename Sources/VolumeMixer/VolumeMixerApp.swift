@@ -29,6 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private let popover = NSPopover()
     private var statusItem: NSStatusItem!
     private var cancellables = Set<AnyCancellable>()
+    private var shownContent: MenuBarContent?
+    private var shownScale: CGFloat = 0
+    private var termSource: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -55,13 +58,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             .debounce(for: .milliseconds(50), scheduler: RunLoop.main)
             .sink { [weak self] in self?.updateStatusImage() }
             .store(in: &cancellables)
+        // Moving to a display with another scale factor needs a re-render even if the text is the same.
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .sink { [weak self] _ in self?.updateStatusImage() }
+            .store(in: &cancellables)
         updateStatusImage()
+
+        // `kill` / build.sh --install: quit the normal way, so taps and keep-awake are cleaned up.
+        signal(SIGTERM, SIG_IGN)
+        let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        term.setEventHandler { NSApp.terminate(nil) }
+        term.resume()
+        termSource = term
     }
 
+    /// Re-rasterizes the status item only when what it shows (or the screen scale) actually changed.
     private func updateStatusImage() {
-        statusItem.button?.image = menuBarStatsImage(items: stats.menuBarItems,
-                                                     symbol: mixer.menuBarSymbol, stats: stats, ai: ai,
-                                                     awake: awake.isActive, messages: messages)
+        let content = MenuBarContent(items: stats.menuBarItems, symbol: mixer.menuBarSymbol, stats: stats, ai: ai,
+                                     awake: awake.isActive, messages: messages)
+        let scale = statusItem.button?.window?.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        guard content != shownContent || scale != shownScale else { return }
+        shownContent = content
+        shownScale = scale
+        statusItem.button?.image = menuBarStatsImage(content, scale: scale)
     }
 
     @objc private func statusItemClicked() {
@@ -226,7 +245,7 @@ enum PopoverTab: String, CaseIterable {
     case shelf = "素材"
 }
 
-/// One menu bar item, two pages: the mixer and system status.
+/// One menu bar item, five pages; ⌘1–⌘5 switch between them.
 struct PopoverView: View {
     @EnvironmentObject private var mixer: Mixer
     @EnvironmentObject private var stats: SystemStats
@@ -244,6 +263,7 @@ struct PopoverView: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
+            .help("⌘1–⌘5 切换")
 
             switch tab {
             case .volume:
@@ -274,6 +294,15 @@ struct PopoverView: View {
         }
         .padding(14)
         .frame(width: 320)
+        .background {
+            ForEach(Array(PopoverTab.allCases.enumerated()), id: \.offset) { index, page in
+                Button("") { tab = page }
+                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+            }
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+        }
     }
 
     private var awakeRow: some View {

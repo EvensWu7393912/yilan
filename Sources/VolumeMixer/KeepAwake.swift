@@ -30,6 +30,7 @@ final class KeepAwake: ObservableObject {
     private var assertionID: IOPMAssertionID = 0
     private var timer: Timer?
     private var batteryTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
     private static let displayKey = "keepAwakeAllowDisplaySleep"
     private static let lidKey = "keepAwakeClosedLid"
     private static let sleepDisabledKey = "keepAwakeSleepDisabledByUs"
@@ -37,23 +38,34 @@ final class KeepAwake: ObservableObject {
     init() {
         // A crash or force-quit mid-session would leave `disablesleep` on forever; undo it at launch.
         if UserDefaults.standard.bool(forKey: Self.sleepDisabledKey) { setSleepDisabled(false) }
+        // Timers don't count time spent asleep: after a wake, end the session on its real end time.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleEnd() }
+        }
     }
 
     /// Starts (or restarts) a session; `nil` means until stopped.
     func start(for seconds: TimeInterval?) {
-        timer?.invalidate()
-        timer = nil
         stoppedForBattery = false
         endDate = seconds.map { Date().addingTimeInterval($0) }
-        if let seconds {
-            timer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
-                MainActor.assumeIsolated { self?.stop() }
-            }
-        }
         assert()
         if assertionID == 0 { stop(); return }
         isActive = true
         applyLid()
+        scheduleEnd()
+    }
+
+    /// (Re)arms the end-of-session timer from `endDate`; stops right away if that has already passed.
+    private func scheduleEnd() {
+        timer?.invalidate()
+        timer = nil
+        guard isActive, let end = endDate else { return }
+        let left = end.timeIntervalSinceNow
+        guard left > 0 else { stop(); return }
+        timer = Timer.scheduledTimer(withTimeInterval: left, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stop() }
+        }
     }
 
     func stop() {

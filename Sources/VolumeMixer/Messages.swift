@@ -39,11 +39,15 @@ final class MessageWatcher: ObservableObject {
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
 
-    init() {
-        apps = Self.known.compactMap { entry in
+    private static func installed() -> [ChatApp] {
+        known.compactMap { entry in
             NSWorkspace.shared.urlForApplication(withBundleIdentifier: entry.id)
                 .map { ChatApp(id: entry.id, name: entry.name, url: $0) }
         }
+    }
+
+    init() {
+        apps = Self.installed()
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -55,6 +59,11 @@ final class MessageWatcher: ObservableObject {
 
     func setVisible(_ visible: Bool) {
         pageVisible = visible
+        if visible {
+            // Pick up chat apps installed, moved or removed since launch.
+            let found = Self.installed()
+            if found.map(\.id) != apps.map(\.id) || found.map(\.url) != apps.map(\.url) { apps = found }
+        }
         reschedule()
     }
 
@@ -66,6 +75,7 @@ final class MessageWatcher: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
+        timer?.tolerance = interval * 0.1
     }
 
     func refresh() {

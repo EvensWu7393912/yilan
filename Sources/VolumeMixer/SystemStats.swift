@@ -37,7 +37,8 @@ enum MenuBarItem: String, CaseIterable {
 }
 
 /// Samples CPU, memory, disk, network and battery: every second while the status page is visible,
-/// every 2 s in the background while any readout is shown in the menu bar.
+/// every 2 s in the background while any readout is shown in the menu bar. Slow-moving or costly
+/// readings (disk space, the battery registry, the primary interface) are refreshed less often.
 @MainActor
 final class SystemStats: ObservableObject {
     static let historyLength = 60
@@ -66,6 +67,11 @@ final class SystemStats: ObservableObject {
     private var lastTicks: (user: UInt64, system: UInt64, idle: UInt64, nice: UInt64)?
     private var lastNet: [String: (rx: UInt32, tx: UInt32)] = [:]
     private var lastNetTime: Date?
+    private var lastCPUTime: Date?
+    private var lastDiskTime: Date?
+    private var primary: (name: String?, at: Date)?
+    private var adapter: (watts: Double?, at: Date)?
+    private let store = SCDynamicStoreCreate(nil, "VolumeMixer" as CFString, nil, nil)
 
     var memoryFraction: Double { memoryTotal == 0 ? 0 : Double(memoryUsed) / Double(memoryTotal) }
     var diskFraction: Double { diskTotal == 0 ? 0 : Double(diskTotal - diskFree) / Double(diskTotal) }
@@ -99,9 +105,11 @@ final class SystemStats: ObservableObject {
         timer = nil
         guard let interval: TimeInterval = pageVisible ? 1 : (menuBarItems.isDisjoint(with: MenuBarItem.systemItems) ? nil : 2) else { return }
         sample()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.sample() }
         }
+        timer.tolerance = interval * 0.1 // lets the system batch wakeups
+        self.timer = timer
     }
 
     private func sample() {
@@ -109,13 +117,21 @@ final class SystemStats: ObservableObject {
         sampleMemory()
         sampleDisk()
         sampleNetwork()
-        sampleBattery()
-        uptime = ProcessInfo.processInfo.systemUptime
+        // The battery is only read while something shows it.
+        if pageVisible || menuBarItems.contains(.power) { sampleBattery() }
+        if pageVisible { uptime = ProcessInfo.processInfo.systemUptime }
     }
+
+    /// Opening the page or toggling a readout samples right away; rates measured over a few
+    /// milliseconds since the last tick would be noise, so those wait for the next one.
+    private static let minimumRateInterval: TimeInterval = 0.5
 
     // MARK: CPU
 
     private func sampleCPU() {
+        let time = Date()
+        if let last = lastCPUTime, time.timeIntervalSince(last) < Self.minimumRateInterval { return }
+        lastCPUTime = time
         var info = host_cpu_load_info()
         var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.stride / MemoryLayout<integer_t>.stride)
         let kr = withUnsafeMutablePointer(to: &info) {
@@ -161,23 +177,29 @@ final class SystemStats: ObservableObject {
     // MARK: Disk
 
     private func sampleDisk() {
+        // Free space moves slowly and this query is the slowest of the lot.
+        let time = Date()
+        if let last = lastDiskTime, time.timeIntervalSince(last) < (pageVisible ? 10 : 30) { return }
+        lastDiskTime = time
         let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey]
         guard let values = try? URL(fileURLWithPath: "/").resourceValues(forKeys: keys),
               let total = values.volumeTotalCapacity,
               let free = values.volumeAvailableCapacityForImportantUsage else { return }
-        diskTotal = Int64(total)
-        diskFree = free
+        if diskTotal != Int64(total) { diskTotal = Int64(total) }
+        if diskFree != free { diskFree = free }
     }
 
     // MARK: Network
 
     private func sampleNetwork() {
+        let now = Date()
+        if let last = lastNetTime, now.timeIntervalSince(last) < Self.minimumRateInterval { return }
         var ifap: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifap) == 0, let first = ifap else { return }
         defer { freeifaddrs(ifap) }
 
         // Count only the primary interface (like Stats), so VPN traffic isn't counted twice.
-        let primary = Self.primaryInterface()
+        let primary = primaryInterface(now: now)
         var current: [String: (rx: UInt32, tx: UInt32)] = [:]
         for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
             let ifa = p.pointee
@@ -190,7 +212,6 @@ final class SystemStats: ObservableObject {
             current[name] = (data.pointee.ifi_ibytes, data.pointee.ifi_obytes)
         }
 
-        let now = Date()
         defer { lastNet = current; lastNetTime = now }
         guard let lastTime = lastNetTime else { return }
         let dt = now.timeIntervalSince(lastTime)
@@ -214,7 +235,7 @@ final class SystemStats: ObservableObject {
     private func sampleBattery() {
         guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
               let list = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [CFTypeRef] else {
-            battery = nil
+            if battery != nil { battery = nil }
             return
         }
         for source in list {
@@ -231,22 +252,33 @@ final class SystemStats: ObservableObject {
                 minutesRemaining: (minutes ?? -1) > 0 ? minutes : nil
             )
             readPower(into: &info)
-            battery = info
+            if battery != info { battery = info }
             return
         }
-        battery = nil
+        if battery != nil { battery = nil }
     }
 
     /// Power figures: live SMC sensors when available, else the AppleSmartBattery registry entry
     /// (which the battery firmware only refreshes about once a minute).
     private func readPower(into info: inout BatteryInfo) {
-        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
-        guard service != 0 else { return }
-        defer { IOObjectRelease(service) }
-        var props: Unmanaged<CFMutableDictionary>?
-        guard IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
-              let dict = props?.takeRetainedValue() as? [String: Any] else { return }
+        // PSTR = total system power, PDTR = adapter input, PPBR = battery discharge rate (all watts).
+        if let smc, let system = smc.float("PSTR"), system > 0 {
+            var batteryWatts: Double?
+            if let input = smc.float("PDTR"), input > 0 {
+                batteryWatts = input - system
+            } else if let discharge = smc.float("PPBR") {
+                batteryWatts = -discharge
+            }
+            if let batteryWatts {
+                // Everything live came from the SMC; the registry is only needed for the charger rating.
+                info.systemWatts = system
+                info.batteryWatts = batteryWatts
+                info.adapterWatts = adapterRating(onAC: info.onAC)
+                return
+            }
+        }
 
+        guard let dict = Self.batteryRegistry() else { return }
         // Amperage is a signed mA value that ioreg shows as unsigned; int64Value restores the sign.
         if let mV = (dict["Voltage"] as? NSNumber)?.int64Value,
            let mA = (dict["InstantAmperage"] as? NSNumber ?? dict["Amperage"] as? NSNumber)?.int64Value {
@@ -258,26 +290,49 @@ final class SystemStats: ObservableObject {
         } else if let b = info.batteryWatts, b < 0 {
             info.systemWatts = -b
         }
-        if let adapter = dict["AdapterDetails"] as? [String: Any],
-           let watts = (adapter["Watts"] as? NSNumber)?.doubleValue, watts > 0 {
-            info.adapterWatts = watts
-        }
-
-        // PSTR = total system power, PDTR = adapter input, PPBR = battery discharge rate (all watts).
-        if let smc, let system = smc.float("PSTR"), system > 0 {
-            info.systemWatts = system
-            if let input = smc.float("PDTR"), input > 0 {
-                info.batteryWatts = input - system
-            } else if let discharge = smc.float("PPBR") {
-                info.batteryWatts = -discharge
-            }
-        }
+        info.adapterWatts = Self.adapterWatts(in: dict)
+        adapter = (info.adapterWatts, Date())
+        if let smc, let system = smc.float("PSTR"), system > 0 { info.systemWatts = system }
     }
 
-    private static func primaryInterface() -> String? {
-        guard let store = SCDynamicStoreCreate(nil, "VolumeMixer" as CFString, nil, nil),
-              let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] else { return nil }
-        return global["PrimaryInterface"] as? String
+    /// The charger's rating only changes when it is plugged or unplugged; re-read every 30 s at most,
+    /// and right away when the power source flips.
+    private func adapterRating(onAC: Bool) -> Double? {
+        guard onAC else {
+            adapter = nil
+            return nil
+        }
+        if let adapter, adapter.watts != nil, Date().timeIntervalSince(adapter.at) < 30 { return adapter.watts }
+        if let adapter, adapter.watts == nil, Date().timeIntervalSince(adapter.at) < 5 { return nil }
+        let watts = Self.batteryRegistry().flatMap(Self.adapterWatts(in:))
+        adapter = (watts, Date())
+        return watts
+    }
+
+    private static func adapterWatts(in dict: [String: Any]) -> Double? {
+        guard let details = dict["AdapterDetails"] as? [String: Any],
+              let watts = (details["Watts"] as? NSNumber)?.doubleValue, watts > 0 else { return nil }
+        return watts
+    }
+
+    private static func batteryRegistry() -> [String: Any]? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        var props: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS else { return nil }
+        return props?.takeRetainedValue() as? [String: Any]
+    }
+
+    /// The default route's interface, re-resolved every 5 s (it only changes when the network does).
+    private func primaryInterface(now: Date) -> String? {
+        if let primary, now.timeIntervalSince(primary.at) < 5 { return primary.name }
+        var name: String?
+        if let store, let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any] {
+            name = global["PrimaryInterface"] as? String
+        }
+        primary = (name, now)
+        return name
     }
 
     private static func push(_ value: Double, to history: inout [Double]) {

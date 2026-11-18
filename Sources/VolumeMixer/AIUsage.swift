@@ -104,6 +104,7 @@ final class AIUsage: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
+        timer?.tolerance = interval * 0.1
     }
 
     func refresh() {
@@ -290,16 +291,29 @@ private final class ClaudeLogScanner: @unchecked Sendable {
         guard size > offset, let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }
         try? handle.seek(toOffset: offset)
-        guard let data = try? handle.readToEnd(), let lastNewline = data.lastIndex(of: 0x0A) else { return }
 
-        // Stop at the last complete line; a half-written line is picked up next time.
-        var lineStart = data.startIndex
-        while lineStart <= lastNewline, let end = data[lineStart...lastNewline].firstIndex(of: 0x0A) {
-            let line = data[lineStart..<end]
-            if line.range(of: marker) != nil { parse(line) }
-            lineStart = end + 1
+        // Session logs reach hundreds of MB, so read in chunks rather than the whole remainder at once.
+        // Only complete lines are consumed; a half-written last line is picked up next time.
+        var pending = Data()
+        var consumed: UInt64 = 0
+        var more = true
+        while more {
+            more = autoreleasepool {
+                guard let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
+                pending.append(chunk)
+                guard let lastNewline = pending.lastIndex(of: 0x0A) else { return true }
+                var lineStart = pending.startIndex
+                while lineStart <= lastNewline, let end = pending[lineStart...lastNewline].firstIndex(of: 0x0A) {
+                    let line = pending[lineStart..<end]
+                    if line.range(of: marker) != nil { parse(line) }
+                    lineStart = end + 1
+                }
+                consumed += UInt64(lastNewline - pending.startIndex + 1)
+                pending = Data(pending[(lastNewline + 1)...]) // re-based copy of the unfinished tail
+                return true
+            }
         }
-        offsets[path] = offset + UInt64(lastNewline - data.startIndex + 1)
+        offsets[path] = offset + consumed
     }
 
     private func parse(_ line: Data) {

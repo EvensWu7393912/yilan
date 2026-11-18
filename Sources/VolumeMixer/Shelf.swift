@@ -31,6 +31,8 @@ final class Shelf: ObservableObject {
     private let fm = FileManager.default
     private var watcher: DirectoryWatcher?
     private var shelfWatcher: DirectoryWatcher?
+    /// Copies run here one at a time, so a large file never freezes the menu bar and names stay unique.
+    private let copyQueue = DispatchQueue(label: "VolumeMixer.shelf", qos: .userInitiated)
 
     init() {
         directory = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -58,19 +60,29 @@ final class Shelf: ObservableObject {
     // MARK: Adding
 
     func add(fileURLs: [URL]) {
-        for url in fileURLs where !url.standardizedFileURL.path.hasPrefix(directory.standardizedFileURL.path) {
-            let target = uniqueURL(for: url.lastPathComponent)
-            try? fm.copyItem(at: url, to: target)
-            touch(target)
+        let directory = directory
+        let inside = directory.standardizedFileURL.path + "/"
+        let sources = fileURLs.filter { !$0.standardizedFileURL.path.hasPrefix(inside) }
+        guard !sources.isEmpty else { return }
+        copyQueue.async { [weak self] in
+            let fm = FileManager.default
+            for url in sources {
+                let target = Self.uniqueURL(for: url.lastPathComponent, in: directory)
+                guard (try? fm.copyItem(at: url, to: target)) != nil else { continue }
+                // Copies keep the original creation date; reset it so the newest addition sorts first.
+                try? fm.setAttributes([.creationDate: Date(), .modificationDate: Date()], ofItemAtPath: target.path)
+            }
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.reload() } }
         }
-        reload()
     }
 
     func add(imageData: Data, ext: String) {
         let stamp = Self.stampFormatter.string(from: Date())
-        let target = uniqueURL(for: "粘贴 \(stamp).\(ext)")
-        try? imageData.write(to: target)
-        reload()
+        let directory = directory
+        copyQueue.async { [weak self] in
+            try? imageData.write(to: Self.uniqueURL(for: "粘贴 \(stamp).\(ext)", in: directory))
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.reload() } }
+        }
     }
 
     /// Reads whatever is on the clipboard: copied files first, then raw image data
@@ -122,21 +134,16 @@ final class Shelf: ObservableObject {
 
     // MARK: Helpers
 
-    private func uniqueURL(for name: String) -> URL {
+    nonisolated private static func uniqueURL(for name: String, in directory: URL) -> URL {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         var candidate = directory.appendingPathComponent(name)
         var n = 2
-        while fm.fileExists(atPath: candidate.path) {
+        while FileManager.default.fileExists(atPath: candidate.path) {
             candidate = directory.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
             n += 1
         }
         return candidate
-    }
-
-    /// Copies keep the original creation date; reset it so the newest addition sorts first.
-    private func touch(_ url: URL) {
-        try? fm.setAttributes([.creationDate: Date(), .modificationDate: Date()], ofItemAtPath: url.path)
     }
 
     private static let stampFormatter: DateFormatter = {
