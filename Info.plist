@@ -20,6 +20,8 @@
     <string>14.2</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>素材页自动收集新截图需要读取截图保存位置（默认是桌面）。只复制截图，不改动原文件。</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>需要接管各应用的音频输出，才能单独调节每个应用的音量。音频不会被录制或保存。</string>
 </dict>

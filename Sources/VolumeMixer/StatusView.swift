@@ -209,7 +209,7 @@ private struct MenuBarStatsLabel: View {
     let messages: MessageWatcher
 
     var body: some View {
-        let groups: [[MenuBarItem]] = [[.messages], [.volume], [.cpu, .memory, .disk], [.network], [.power], [.claude, .codex]]
+        let groups: [[MenuBarItem]] = [[.messages], [.volume], [.cpu, .memory, .disk], [.network], [.power], [.claude, .codex, .grok]]
             .map { $0.filter { items.contains($0) && ($0 != .power || stats.battery != nil)
                                && ($0 != .messages || messages.totalUnread > 0 || messages.hasUnmarkedBadge) } }
             .filter { !$0.isEmpty }
@@ -254,8 +254,7 @@ private struct MenuBarStatsLabel: View {
         case .power:
             if let battery = stats.battery { powerMetric(battery) }
         case .claude:
-            metric(width: 36) { Text("CLAUDE") } value: { Text(ai.plan?.fivePercent.map { "\(Int($0.rounded()))%" }
-                                                                 ?? ai.block.map { compactTokens($0.totals.total) } ?? "0") }
+            metric(width: 36) { Text("CLAUDE") } value: { Text(ai.claudeCurrentPercent.map { "\(Int($0.rounded()))%" } ?? "—") }
         case .messages:
             HStack(spacing: 2) {
                 Image(systemName: "bubble.left.fill").font(.system(size: 11, weight: .medium))
@@ -267,6 +266,8 @@ private struct MenuBarStatsLabel: View {
             .fixedSize()
         case .codex:
             metric(width: 34) { Text("CODEX") } value: { Text(ai.codexCurrentPercent.map { "\(Int($0.rounded()))%" } ?? "—") }
+        case .grok:
+            metric(width: 30) { Text("GROK") } value: { Text(ai.grokCurrentPercent.map { "\(Int($0.rounded()))%" } ?? "—") }
         }
     }
 

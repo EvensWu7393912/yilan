@@ -16,14 +16,16 @@ enum VolumeMixerApp {
 }
 
 /// Owns the status item directly (MenuBarExtra can't tell left from right clicks):
-/// left click opens the mixer/status popover, right click opens the display-options menu.
+/// left click opens the mixer/status popover, right click opens the display-options menu,
+/// and files or images dropped straight onto the menu bar icon go onto the 素材 page.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     private let mixer = Mixer()
     private let stats = SystemStats()
     private let ai = AIUsage()
     private let awake = KeepAwake()
     private let messages = MessageWatcher()
+    private let shelf = Shelf()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem!
     private var cancellables = Set<AnyCancellable>()
@@ -34,6 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            // The status button's window forwards drag events to its delegate.
+            button.window?.registerForDraggedTypes([.fileURL, .png, .tiff])
+            button.window?.delegate = self
         }
         popover.behavior = .transient
         popover.animates = false
@@ -41,7 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         stats.$menuBarItems
             .sink { [weak self] items in
-                self?.ai.menuBarActive = !items.isDisjoint(with: [.claude, .codex])
+                self?.ai.menuBarActive = !items.isDisjoint(with: [.claude, .codex, .grok])
                 self?.messages.menuBarActive = items.contains(.messages)
             }
             .store(in: &cancellables)
@@ -72,7 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // A fresh hosting controller per open, so onAppear/onDisappear start and stop sampling.
             let host = NSHostingController(rootView: PopoverView(dismiss: { [weak self] in self?.popover.performClose(nil) })
                 .environmentObject(mixer).environmentObject(stats).environmentObject(ai).environmentObject(awake)
-                .environmentObject(messages))
+                .environmentObject(messages).environmentObject(shelf))
             host.sizingOptions = .preferredContentSize
             popover.contentViewController = host
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -86,6 +91,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         popover.contentViewController = nil
+    }
+
+    // MARK: Dropping onto the menu bar icon
+
+    func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+
+    func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        shelf.accept(pasteboard: sender.draggingPasteboard)
     }
 
     // MARK: Right-click menu
@@ -105,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(awakeMenuItem())
+        menu.addItem(shelfMenuItem())
         menu.addItem(.separator())
         let login = NSMenuItem(title: "登录时启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         login.target = self
@@ -172,6 +186,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func removeLidHelper() { awake.uninstallLidHelper() }
 
+    private func shelfMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: shelf.items.isEmpty ? "素材" : "素材（\(shelf.items.count)）", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let paste = NSMenuItem(title: "从剪贴板添加", action: #selector(shelfPaste), keyEquivalent: "")
+        paste.target = self
+        sub.addItem(paste)
+        let reveal = NSMenuItem(title: "在访达中打开", action: #selector(shelfReveal), keyEquivalent: "")
+        reveal.target = self
+        sub.addItem(reveal)
+        let clear = NSMenuItem(title: "清空", action: #selector(shelfClear), keyEquivalent: "")
+        clear.target = self
+        clear.isEnabled = !shelf.items.isEmpty
+        sub.addItem(clear)
+        sub.addItem(.separator())
+        let collect = NSMenuItem(title: "自动收集新截图", action: #selector(shelfToggleCollect), keyEquivalent: "")
+        collect.target = self
+        collect.state = shelf.collectScreenshots ? .on : .off
+        sub.addItem(collect)
+        item.submenu = sub
+        return item
+    }
+
+    @objc private func shelfPaste() { shelf.pasteFromClipboard() }
+    @objc private func shelfReveal() { NSWorkspace.shared.open(shelf.directory) }
+    @objc private func shelfClear() { shelf.clear() }
+    @objc private func shelfToggleCollect() { shelf.collectScreenshots.toggle() }
+
     @objc private func toggleLaunchAtLogin() {
         mixer.launchAtLogin.toggle()
     }
@@ -182,6 +223,7 @@ enum PopoverTab: String, CaseIterable {
     case status = "状态"
     case ai = "AI"
     case messages = "消息"
+    case shelf = "素材"
 }
 
 /// One menu bar item, two pages: the mixer and system status.
@@ -191,6 +233,7 @@ struct PopoverView: View {
     @EnvironmentObject private var ai: AIUsage
     @EnvironmentObject private var awake: KeepAwake
     @EnvironmentObject private var messages: MessageWatcher
+    @EnvironmentObject private var shelf: Shelf
     var dismiss: () -> Void = {}
     @AppStorage("popoverTab") private var tab = PopoverTab.volume
 
@@ -219,6 +262,9 @@ struct PopoverView: View {
                 MessagesView(dismiss: dismiss)
                     .onAppear { messages.setVisible(true) }
                     .onDisappear { messages.setVisible(false) }
+            case .shelf:
+                ShelfView()
+                    .onAppear { shelf.reload() }
             }
 
             Divider()

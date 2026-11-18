@@ -8,6 +8,8 @@ struct AIView: View {
             claudeSection
             Divider()
             codexSection
+            Divider()
+            grokSection
             footer
         }
     }
@@ -32,23 +34,25 @@ struct AIView: View {
 
             planRows
 
-            if let block = ai.block {
+            if !ai.planLimits.isEmpty {
+                EmptyView() // Anthropic's own figures above replace the estimate from local logs.
+            } else if let block = ai.block {
                 let now = Date()
                 let elapsed = now.timeIntervalSince(block.start) / block.end.timeIntervalSince(block.start)
-                StatRow(symbol: "clock", title: "当前 5 小时窗口",
+                StatRow(symbol: "clock", title: "本机 5 小时估算",
                         value: "\(remaining(until: block.end)) 后重置", fraction: elapsed,
                         detail: "\(time(block.start))–\(time(block.end)) · \(block.totals.requests) 次请求 · \(compactTokens(block.totals.total)) tokens",
                         tint: .accentColor)
             } else {
-                StatRow(symbol: "clock", title: "当前 5 小时窗口", value: "空闲", fraction: 0,
-                        detail: "最近 5 小时内没有 Claude Code 请求")
+                StatRow(symbol: "clock", title: "本机 5 小时估算", value: "空闲", fraction: 0,
+                        detail: "本机 5 小时内没有 Claude Code 请求")
             }
 
             HStack(alignment: .top, spacing: 10) {
                 RowIcon(symbol: "sun.max")
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        Text("今日")
+                        Text("本机今日")
                         Spacer()
                         Text("\(compactTokens(ai.today.total)) tokens")
                             .font(.caption).monospacedDigit().foregroundStyle(.secondary)
@@ -72,7 +76,7 @@ struct AIView: View {
                 RowIcon(symbol: "calendar")
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
-                        Text("近 7 天")
+                        Text("本机近 7 天")
                         Spacer()
                         Text("\(compactTokens(ai.week.total)) tokens · \(ai.week.requests) 次")
                             .font(.caption).monospacedDigit().foregroundStyle(.secondary)
@@ -85,22 +89,34 @@ struct AIView: View {
 
     @ViewBuilder
     private var planRows: some View {
-        switch ai.plan {
-        case .ok(let limits, _)?:
-            ForEach(limits, id: \.key) { limit in
+        planNotice
+        if !ai.planLimits.isEmpty {
+            ForEach(ai.planLimits, id: \.key) { limit in
                 StatRow(symbol: "gauge.with.dots.needle.50percent", title: limit.name,
                         value: "\(Int(limit.percent.rounded()))%", fraction: limit.percent / 100,
                         detail: limit.resetsAt.map { "\(remaining(until: $0)) 后重置 · \(dateTime($0))" } ?? "暂无重置时间")
             }
+        }
+    }
+
+    @ViewBuilder
+    private var planNotice: some View {
+        switch ai.plan {
         case .expired?:
-            notice("Claude 登录已过期：在终端运行一次 claude 即可刷新，套餐用量随后显示。")
+            notice("Claude 登录已过期，自动刷新没有成功：在终端运行 claude 重新登录。\(staleNote)")
         case .noLogin?:
-            notice("未读取到 Claude Code 登录（需在钥匙串弹窗中允许访问）。")
+            notice("未读取到 Claude Code 登录：在终端运行 claude 登录。\(staleNote)")
+        case .rateLimited?:
+            notice("Anthropic 暂时限制了查询，稍后自动重试。\(staleNote)")
         case .failed(let reason)?:
-            notice("套餐用量获取失败：\(reason)")
-        case nil:
+            notice("套餐用量获取失败：\(reason)。\(staleNote)")
+        case .ok?, nil:
             EmptyView()
         }
+    }
+
+    private var staleNote: String {
+        ai.planUpdated.map { "下方为 \(dateTime($0)) 的数据。" } ?? ""
     }
 
     private func notice(_ text: String) -> some View {
@@ -140,8 +156,65 @@ struct AIView: View {
         }
     }
 
+    // MARK: Grok
+
+    @ViewBuilder
+    private var grokSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Grok Bot").font(.headline)
+                if let plan = ai.grokUsage?.plan {
+                    Text(plan.uppercased())
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Capsule().fill(Color.primary.opacity(0.1)))
+                }
+                Spacer()
+                if ai.grokUsage != nil {
+                    Button("退出登录") { ai.unlinkGrok() }
+                        .buttonStyle(.link).font(.caption2)
+                }
+            }
+
+            switch ai.grok {
+            case .expired?:
+                notice("Grok Bot 登录已过期，请重新登录。")
+                linkButton
+            case .failed(let reason)?:
+                notice("Grok Bot 用量获取失败：\(reason)")
+                if ai.grokUsage == nil { linkButton }
+            case .notLinked?:
+                linkButton
+            case .ok?, nil:
+                EmptyView()
+            }
+
+            if let usage = ai.grokUsage, let used = usage.percent {
+                StatRow(symbol: "gauge.with.dots.needle.67percent", title: "每周限额",
+                        value: "\(Int(used.rounded()))%", fraction: used / 100,
+                        detail: grokDetail(usage))
+            }
+        }
+    }
+
+    private var linkButton: some View {
+        Button(ai.grokLinking ? "等待浏览器登录…" : "登录 Grok Bot") { ai.linkGrok() }
+            .controlSize(.small)
+            .disabled(ai.grokLinking)
+    }
+
+    private func grokDetail(_ usage: GrokUsage) -> String {
+        var parts: [String] = []
+        if let reset = usage.resetsAt { parts.append("\(remaining(until: reset)) 后重置") }
+        if let cents = usage.onDemandCents, cents > 0 {
+            parts.append("按需 $" + String(format: "%.2f", cents / 100))
+        }
+        if usage.available == false { parts.append("已用完") }
+        return parts.isEmpty ? "暂无重置时间" : parts.joined(separator: " · ")
+    }
+
     private var footer: some View {
-        Text("套餐百分比来自 Anthropic（含 claude.ai 聊天）；token 统计仅本机 Claude Code 日志，含缓存读写。")
+        Text("套餐百分比来自 Anthropic，含 claude.ai 聊天。「本机」各项只统计这台 Mac 的 Claude Code 日志，含缓存读写，不含 Claude 应用和云端任务。")
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)

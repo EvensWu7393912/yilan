@@ -54,10 +54,31 @@ final class AIUsage: ObservableObject {
     @Published private(set) var scanning = false
     @Published private(set) var plan: PlanStatus?
     @Published private(set) var planFetchedAt: Date?
+    /// Last successful numbers, kept while the login has expired or the endpoint is rate limiting.
+    @Published private(set) var planLimits: [PlanLimit] = []
+    @Published private(set) var planUpdated: Date?
     private var planTask: Task<Void, Never>?
+    private var planRetryAfter: Date?
+
+    @Published private(set) var grok: GrokStatus?
+    @Published private(set) var grokUsage: GrokUsage?
+    @Published private(set) var grokUpdated: Date?
+    @Published private(set) var grokLinking = false
+    private var grokFetchedAt: Date?
+    private var grokTask: Task<Void, Never>?
 
     var menuBarActive = false {
         didSet { if menuBarActive != oldValue { reschedule() } }
+    }
+
+    /// Claude's real 5-hour figure from Anthropic; nil once that window has passed.
+    var claudeCurrentPercent: Double? {
+        planLimits.first { $0.key == "five_hour" && ($0.resetsAt ?? .distantFuture) > Date() }?.percent
+    }
+
+    var grokCurrentPercent: Double? {
+        guard let usage = grokUsage, (usage.resetsAt ?? .distantFuture) > Date() else { return nil }
+        return usage.percent
     }
 
     /// The tightest Codex window still in effect; nil once every logged window has reset.
@@ -87,6 +108,7 @@ final class AIUsage: ObservableObject {
 
     func refresh() {
         refreshPlanIfStale()
+        refreshGrokIfStale()
         guard !scanning else { return }
         scanning = true
         let scanner = scanner
@@ -115,14 +137,66 @@ extension AIUsage {
     private func refreshPlanIfStale() {
         let maxAge: TimeInterval = pageVisibleForPlan ? 120 : 300
         if let last = planFetchedAt, Date().timeIntervalSince(last) < maxAge { return }
+        if let retry = planRetryAfter, retry > Date() { return }
         guard planTask == nil else { return }
         planTask = Task { [weak self] in
             let status = await ClaudePlanClient.fetch()
             guard let self else { return }
             self.plan = status
             self.planFetchedAt = Date()
+            self.planRetryAfter = nil
+            switch status {
+            case .ok(let limits, _):
+                self.planLimits = limits
+                self.planUpdated = Date()
+            case .rateLimited(let wait):
+                self.planRetryAfter = Date().addingTimeInterval(wait)
+            default:
+                break
+            }
             self.planTask = nil
         }
+    }
+
+    private func refreshGrokIfStale() {
+        let maxAge: TimeInterval = pageVisible ? 120 : 300
+        if let last = grokFetchedAt, Date().timeIntervalSince(last) < maxAge { return }
+        guard grokTask == nil, !grokLinking else { return }
+        grokTask = Task { [weak self] in
+            let status = await GrokClient.fetch()
+            guard let self else { return }
+            self.grok = status
+            self.grokFetchedAt = Date()
+            switch status {
+            case .ok(let usage):
+                self.grokUsage = usage
+                self.grokUpdated = Date()
+            case .notLinked:
+                self.grokUsage = nil
+            default:
+                break
+            }
+            self.grokTask = nil
+        }
+    }
+
+    func linkGrok() {
+        guard !grokLinking else { return }
+        grokLinking = true
+        Task { [weak self] in
+            let linked = await GrokClient.login()
+            guard let self else { return }
+            self.grokLinking = false
+            self.grokFetchedAt = nil
+            if linked { self.refreshGrokIfStale() } else { self.grok = .failed("登录未完成") }
+        }
+    }
+
+    func unlinkGrok() {
+        GrokClient.unlink()
+        grok = .notLinked
+        grokUsage = nil
+        grokUpdated = nil
     }
 }
 
