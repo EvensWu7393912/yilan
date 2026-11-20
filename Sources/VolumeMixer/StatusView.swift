@@ -216,11 +216,13 @@ struct MenuBarContent: Equatable {
     }
 
     var awake = false
+    var alert = false
     var groups: [[Cell]] = []
 
     @MainActor
-    init(items: Set<MenuBarItem>, symbol: String, stats: SystemStats, ai: AIUsage, awake: Bool, messages: MessageWatcher) {
+    init(items: Set<MenuBarItem>, symbol: String, stats: SystemStats, ai: AIUsage, awake: Bool, messages: MessageWatcher, alert: Bool = false) {
         self.awake = awake
+        self.alert = alert
         let layout: [[MenuBarItem]] = [[.messages], [.volume], [.cpu, .memory, .disk], [.network], [.power], [.claude, .codex, .grok]]
         func limit(_ p: Double?) -> String { p.map { "\(Int($0.rounded()))%" } ?? "—" }
         func cell(_ item: MenuBarItem) -> Cell? {
@@ -259,6 +261,11 @@ private struct MenuBarStatsLabel: View {
 
     var body: some View {
         HStack(spacing: 5) {
+            if content.alert { // 安全页有待处理的异常，总在最左
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 16)
+            }
             if content.awake { // keep-awake session indicator, always leftmost
                 Image(systemName: "cup.and.saucer.fill")
                     .font(.system(size: 11, weight: .medium))

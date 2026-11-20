@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private let awake = KeepAwake()
     private let messages = MessageWatcher()
     private let shelf = Shelf()
+    private let guardian = SecurityGuard()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem!
     private var cancellables = Set<AnyCancellable>()
@@ -53,8 +54,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                 self?.messages.menuBarActive = items.contains(.messages)
             }
             .store(in: &cancellables)
+        guardian.onOpenRequest = { [weak self] in self?.openPopover(tab: .security) }
+        // `一览 打开安全页` from scripts: post this distributed notification.
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.evens.yilan.openSecurity"),
+                                                            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.openPopover(tab: .security) }
+        }
         mixer.objectWillChange.merge(with: stats.objectWillChange, ai.objectWillChange, awake.objectWillChange,
-                                           messages.objectWillChange)
+                                           messages.objectWillChange, guardian.objectWillChange)
             .debounce(for: .milliseconds(50), scheduler: RunLoop.main)
             .sink { [weak self] in self?.updateStatusImage() }
             .store(in: &cancellables)
@@ -75,7 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     /// Re-rasterizes the status item only when what it shows (or the screen scale) actually changed.
     private func updateStatusImage() {
         let content = MenuBarContent(items: stats.menuBarItems, symbol: mixer.menuBarSymbol, stats: stats, ai: ai,
-                                     awake: awake.isActive, messages: messages)
+                                     awake: awake.isActive, messages: messages, alert: guardian.needsAttention)
         let scale = statusItem.button?.window?.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
         guard content != shownContent || scale != shownScale else { return }
         shownContent = content
@@ -92,16 +99,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             awake.toggle() // Option-click: quick keep-awake on/off, like Amphetamine
         } else if popover.isShown {
             popover.performClose(nil)
-        } else if let button = statusItem.button {
-            // A fresh hosting controller per open, so onAppear/onDisappear start and stop sampling.
-            let host = NSHostingController(rootView: PopoverView(dismiss: { [weak self] in self?.popover.performClose(nil) })
-                .environmentObject(mixer).environmentObject(stats).environmentObject(ai).environmentObject(awake)
-                .environmentObject(messages).environmentObject(shelf))
-            host.sizingOptions = .preferredContentSize
-            popover.contentViewController = host
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            NSApp.activate()
+        } else {
+            // While something is flagged, the shield in the menu bar leads straight to the 安全 page.
+            openPopover(tab: guardian.needsAttention ? .security : nil)
         }
+    }
+
+    private func openPopover(tab: PopoverTab? = nil) {
+        if let tab { UserDefaults.standard.set(tab.rawValue, forKey: "popoverTab") }
+        guard let button = statusItem.button else { return }
+        if popover.isShown { popover.performClose(nil) }
+        // A fresh hosting controller per open, so onAppear/onDisappear start and stop sampling.
+        let host = NSHostingController(rootView: PopoverView(dismiss: { [weak self] in self?.popover.performClose(nil) })
+            .environmentObject(mixer).environmentObject(stats).environmentObject(ai).environmentObject(awake)
+            .environmentObject(messages).environmentObject(shelf).environmentObject(guardian))
+        host.sizingOptions = .preferredContentSize
+        popover.contentViewController = host
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -243,9 +258,10 @@ enum PopoverTab: String, CaseIterable {
     case ai = "AI"
     case messages = "消息"
     case shelf = "素材"
+    case security = "安全"
 }
 
-/// One menu bar item, five pages; ⌘1–⌘5 switch between them.
+/// One menu bar item, six pages; ⌘1–⌘6 switch between them.
 struct PopoverView: View {
     @EnvironmentObject private var mixer: Mixer
     @EnvironmentObject private var stats: SystemStats
@@ -253,6 +269,7 @@ struct PopoverView: View {
     @EnvironmentObject private var awake: KeepAwake
     @EnvironmentObject private var messages: MessageWatcher
     @EnvironmentObject private var shelf: Shelf
+    @EnvironmentObject private var guardian: SecurityGuard
     var dismiss: () -> Void = {}
     @AppStorage("popoverTab") private var tab = PopoverTab.volume
 
@@ -263,7 +280,7 @@ struct PopoverView: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .help("⌘1–⌘5 切换")
+            .help("⌘1–⌘6 切换")
 
             switch tab {
             case .volume:
@@ -285,6 +302,10 @@ struct PopoverView: View {
             case .shelf:
                 ShelfView()
                     .onAppear { shelf.reload() }
+            case .security:
+                GuardView()
+                    .onAppear { guardian.setVisible(true) }
+                    .onDisappear { guardian.setVisible(false) }
             }
 
             Divider()
