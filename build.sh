@@ -12,6 +12,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/VolumeMixer "$APP/Contents/MacOS/VolumeMixer"
 cp Info.plist "$APP/Contents/Info.plist"
+cp Icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns" # regenerate with Icon/make_icon.sh
 
 # A stable signing identity keeps the permissions (audio capture, accessibility, Desktop, keychain)
 # across rebuilds; an ad-hoc signature changes every build and loses them each time.

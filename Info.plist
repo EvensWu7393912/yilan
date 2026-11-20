@@ -10,6 +10,8 @@
     <string>一览</string>
     <key>CFBundleExecutable</key>
     <string>VolumeMixer</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

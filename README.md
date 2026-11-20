@@ -30,7 +30,7 @@ macOS 菜单栏小工具：分应用音量控制 + 系统状态（CPU / 内存 /
 ./build.sh --install
 ```
 
-只构建不安装就去掉 `--install`。脚本会用钥匙串里的 Apple Development 证书签名（没有就退回 ad-hoc），这样重新构建后音频捕获、辅助功能、桌面访问这些授权都还在；ad-hoc 签名每次构建都要重新授权。`--install` 会正常退出正在运行的一览（保持唤醒和音频接管会收尾），换上新包再打开。
+只构建不安装就去掉 `--install`。图标由 `Icon/make_icon.swift` 用代码画出（「一」字横条是菜单栏，下面挂着的面板里三条读数，一眼看全），改了以后运行 `Icon/make_icon.sh` 重新生成 `AppIcon.icns`。脚本会用钥匙串里的 Apple Development 证书签名（没有就退回 ad-hoc），这样重新构建后音频捕获、辅助功能、桌面访问这些授权都还在；ad-hoc 签名每次构建都要重新授权。`--install` 会正常退出正在运行的一览（保持唤醒和音频接管会收尾），换上新包再打开。
 
 需要 macOS 14.2+、Swift 5.9+。Claude 套餐百分比读取钥匙串中 Claude Code 的登录；令牌过期时运行 `claude auth status`，由官方 CLI 自己刷新，本应用不直接刷新。
 
