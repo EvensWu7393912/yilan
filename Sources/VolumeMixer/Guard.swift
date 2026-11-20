@@ -709,9 +709,11 @@ final class GuardScanner: @unchecked Sendable {
             defer { command = ""; when = nil }
             let c = command.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !c.isEmpty, let risk = commandRisk(c) else { return }
-            var detail = risk.reason + "\n" + String(c.prefix(240))
+            // Decoded URL and time first: the raw command is mostly a long base64 blob and gets cut off.
+            var detail = risk.reason
             if let decoded = decodedHint(c) { detail += "\n解码后：\(decoded)" }
             if let when { detail += "\n时间：\(when.formatted(date: .abbreviated, time: .shortened))" }
+            detail += "\n" + (c.count > 120 ? String(c.prefix(120)) + "…" : c)
             alerts.append(SecurityAlert(id: "cmd|\(digest(Data(c.utf8)))", kind: .command, severity: risk.severity,
                                         title: "终端运行过可疑命令", detail: detail, path: file,
                                         date: when ?? Date(), event: true))
