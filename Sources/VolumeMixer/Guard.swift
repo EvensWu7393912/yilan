@@ -674,6 +674,11 @@ final class GuardScanner: @unchecked Sendable {
             }
             return nil
         }
+        // Talking to a server on this Mac (a local API, a dev server) is not a download from the internet.
+        if downloadsOnlyFromThisMac(line) { return nil }
+        // `curl … | python3 -c "json.load(sys.stdin)…"` runs the code written in the command and only reads
+        // the download as data; ClickFix needs the download itself to be the script.
+        if pipesOnlyIntoInlineCode(line) { return nil }
         if line.range(of: #"\s-[a-z]*k[a-z]*\s|--insecure"#, options: .regularExpression) != nil {
             return (.critical, "下载时关闭了证书校验（-k），再直接交给 shell 执行")
         }
@@ -682,6 +687,54 @@ final class GuardScanner: @unchecked Sendable {
         }
         if knownInstallHosts.contains(where: { line.contains($0.lowercased()) }) { return nil }
         return (.critical, "从不认识的网站下载脚本并直接交给 shell 执行（ClickFix 骗局的典型做法）")
+    }
+
+    private static let localHostPattern =
+        #"^['"]?([a-z][a-z0-9+.-]*://)?(localhost|127(\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|[a-z0-9.-]+\.localhost)(:\d+)?(/|['"]?$)"#
+
+    static func isOnThisMac(_ target: String) -> Bool {
+        target.lowercased().range(of: localHostPattern, options: .regularExpression) != nil
+    }
+
+    /// Every address in the line points at this Mac (and there is at least one).
+    static func downloadsOnlyFromThisMac(_ line: String) -> Bool {
+        let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        let local = tokens.filter(isOnThisMac)
+        let remote = tokens.filter { $0.contains("://") && !isOnThisMac($0) }
+        return !local.isEmpty && remote.isEmpty
+    }
+
+    /// The pipe only feeds python/perl/ruby/node given their code with `-c`/`-e`, and that code doesn't run stdin.
+    /// Shells never qualify: `sh -c "$(cat)"` runs the download.
+    static func pipesOnlyIntoInlineCode(_ line: String) -> Bool {
+        let shellPipe = #"\|\s*(sudo\s+)?(/bin/|/usr/bin/)?(ba|z|da|k)?sh\b|\|\s*(sudo\s+)?osascript\b"#
+        if line.range(of: shellPipe, options: .regularExpression) != nil { return false }
+        if line.range(of: #"(ba|z)?sh\s+-c\s+["']?\$\((curl|wget)|eval\s+["']?\$\("#, options: .regularExpression) != nil { return false }
+        let inline = #"\|\s*(sudo\s+)?(\S*/)?(python[\d.]*|perl|ruby|node)\s+(-\S*\s+)*-[ce]\s"#
+        let bare = #"\|\s*(sudo\s+)?(\S*/)?(python[\d.]*|perl|ruby|node)\s*($|\||;|&)"#
+        guard line.range(of: inline, options: .regularExpression) != nil,
+              line.range(of: bare, options: .regularExpression) == nil else { return false }
+        let runsInput = #"exec\s*\(|eval\s*\(|compile\s*\(|os\.system|subprocess|popen|\beval\b|__import__"#
+        return line.range(of: runsInput, options: .regularExpression) == nil
+    }
+
+    /// What curl/wget downloads from: a `scheme://` argument, or a bare `host[:port]/path`.
+    static func downloadTarget(_ args: [String]) -> String? {
+        if let url = args.first(where: { $0.contains("://") }) { return url }
+        let takesValue: Set<String> = ["-o", "-H", "-d", "-F", "-X", "-u", "-A", "-e", "-b", "-c", "-T", "-w", "-m",
+                                       "-x", "-K", "-O", "-P", "-U", "-r", "-E", "-Y", "-z", "--output", "--header",
+                                       "--data", "--data-binary", "--data-raw", "--data-urlencode", "--form", "--request",
+                                       "--user", "--user-agent", "--referer", "--cookie", "--cookie-jar", "--max-time",
+                                       "--connect-timeout", "--proxy", "--config", "--write-out", "--retry",
+                                       "--upload-file", "--output-document", "--directory-prefix"]
+        var skip = true // argv[0]
+        for a in args {
+            if skip { skip = false; continue }
+            if takesValue.contains(a) { skip = true; continue }
+            if a.hasPrefix("-") { continue }
+            return a
+        }
+        return nil
     }
 
     /// Readable hint for obfuscated commands: decodes `echo '<base64>'` chunks so the real URL shows.
@@ -792,10 +845,12 @@ final class GuardScanner: @unchecked Sendable {
                       let inp = Self.pipe(of: q.pid, fd: 0),
                       inp.handle == out.peer || inp.peer == out.handle || inp.handle == out.handle else { continue }
                 let args = Self.arguments(of: p.pid) ?? []
-                let commandLine = args.joined(separator: " ") + " | " + qn
+                let interpreterArgs = (Self.arguments(of: q.pid) ?? []).dropFirst()
+                let commandLine = args.joined(separator: " ") + " | " + ([qn] + interpreterArgs).joined(separator: " ")
                 let risk = Self.commandRisk(commandLine)
+                let url = Self.downloadTarget(args) ?? "—"
+                if qn == "base64", Self.isOnThisMac(url) { continue }
                 guard qn == "base64" || risk != nil else { continue }
-                let url = args.first { $0.contains("://") } ?? "—"
                 var a = processAlert(p, .critical, "正在把下载内容直接交给 \(qn) 执行",
                                      (risk?.reason ?? "下载后先 base64 解码") + "\n网址：\(url)")
                 a.id = "pipe|\(Self.digest(Data(commandLine.utf8)))"
