@@ -27,7 +27,30 @@ final class Shelf: ObservableObject {
         }
     }
 
+    /// Copies and clipboard screenshots (⌃⇧⌘4, or screenshots set to go to the clipboard) never
+    /// touch the screenshot folder, so the clipboard is watched separately.
+    @Published var collectClipboard: Bool {
+        didSet {
+            UserDefaults.standard.set(collectClipboard, forKey: "shelfCollectClipboard")
+            updateClipboardWatcher()
+        }
+    }
+
+    /// Items older than this many days go to the Trash; 0 keeps everything.
+    @Published var retentionDays: Int {
+        didSet {
+            UserDefaults.standard.set(retentionDays, forKey: "shelfRetentionDays")
+            pruneExpired()
+        }
+    }
+    static let retentionPresets = [1, 3, 7, 30]
+
     let directory: URL
+    private var pruneTimer: Timer?
+    private var clipboardTimer: Timer?
+    private var lastChangeCount = NSPasteboard.general.changeCount
+    /// The clipboard state already on the shelf, so a later ⌘V doesn't add it twice.
+    private var collectedChangeCount = -1
     private let fm = FileManager.default
     private var watcher: DirectoryWatcher?
     private var shelfWatcher: DirectoryWatcher?
@@ -39,8 +62,18 @@ final class Shelf: ObservableObject {
             .appendingPathComponent("素材夹", isDirectory: true)
         try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
         collectScreenshots = UserDefaults.standard.object(forKey: "shelfCollectScreenshots") as? Bool ?? true
+        collectClipboard = UserDefaults.standard.object(forKey: "shelfCollectClipboard") as? Bool ?? true
+        retentionDays = UserDefaults.standard.object(forKey: "shelfRetentionDays") as? Int ?? 1
         reload()
+        pruneExpired()
         updateWatcher()
+        updateClipboardWatcher()
+        let timer = Timer(timeInterval: 600, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pruneExpired() }
+        }
+        timer.tolerance = 60
+        RunLoop.main.add(timer, forMode: .common)
+        pruneTimer = timer
         // Files added or removed in Finder show up here too, so the shelf never shows stale items.
         shelfWatcher = DirectoryWatcher(url: directory, onChange: { [weak self] _ in
             Task { @MainActor in self?.reload() }
@@ -90,6 +123,7 @@ final class Shelf: ObservableObject {
     @discardableResult
     func pasteFromClipboard() -> Bool {
         let pb = NSPasteboard.general
+        if pb.changeCount == collectedChangeCount { return true }
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
            !urls.isEmpty {
             add(fileURLs: urls)
@@ -132,6 +166,40 @@ final class Shelf: ObservableObject {
         reload()
     }
 
+    // MARK: Expiry
+
+    static func retentionTitle(_ days: Int) -> String {
+        days == 0 ? "不自动清理" : "保留 \(days) 天"
+    }
+
+    /// Moves items added more than `retentionDays` days ago to the Trash.
+    func pruneExpired() {
+        guard retentionDays > 0 else { return }
+        let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86_400)
+        let expired = items.filter { $0.added < cutoff }
+        guard !expired.isEmpty else { return }
+        for item in expired { try? fm.trashItem(at: item.url, resultingItemURL: nil) }
+        reload()
+    }
+
+    /// Asks for a custom number of days; 0 turns cleanup off.
+    func promptCustomRetention() {
+        let alert = NSAlert()
+        alert.messageText = "素材保留几天？"
+        alert.informativeText = "超过这个天数的素材会移到废纸篓。填 0 表示不自动清理。"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 24))
+        field.stringValue = String(retentionDays)
+        field.placeholderString = "天数"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "好")
+        alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+        if let days = Int(text), days >= 0, days <= 3650 { retentionDays = days }
+    }
+
     // MARK: Helpers
 
     nonisolated private static func uniqueURL(for name: String, in directory: URL) -> URL {
@@ -151,6 +219,58 @@ final class Shelf: ObservableObject {
         f.dateFormat = "yyyy-MM-dd HH.mm.ss"
         return f
     }()
+
+    // MARK: Clipboard collection
+
+    private func updateClipboardWatcher() {
+        clipboardTimer?.invalidate()
+        clipboardTimer = nil
+        guard collectClipboard else { return }
+        lastChangeCount = NSPasteboard.general.changeCount
+        // NSPasteboard has no change notification; polling changeCount is cheap.
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkClipboard() }
+        }
+        timer.tolerance = 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        clipboardTimer = timer
+    }
+
+    private static let skippedTypes: Set<String> = [
+        "org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType",
+        "com.agilebits.onepassword", "de.petermaurer.TransientPasteboardType",
+    ]
+    /// Copying a huge file in Finder just to move it shouldn't duplicate it here.
+    private static let maxAutoFileSize = 200 * 1024 * 1024
+
+    private func checkClipboard() {
+        let pb = NSPasteboard.general
+        guard pb.changeCount != lastChangeCount else { return }
+        lastChangeCount = pb.changeCount
+        let types = Set((pb.types ?? []).map(\.rawValue))
+        guard types.isDisjoint(with: Self.skippedTypes) else { return }
+
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty {
+            let files = urls.filter { url in
+                let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                return values?.isRegularFile == true && (values?.fileSize ?? 0) <= Self.maxAutoFileSize
+            }
+            if !files.isEmpty {
+                add(fileURLs: files)
+                collectedChangeCount = pb.changeCount
+            }
+            return
+        }
+        if let data = pb.data(forType: .png) {
+            add(imageData: data, ext: "png")
+        } else if pb.availableType(from: [.tiff]) != nil, let image = NSImage(pasteboard: pb), let data = image.pngData {
+            add(imageData: data, ext: "png")
+        } else {
+            return
+        }
+        collectedChangeCount = pb.changeCount
+    }
 
     // MARK: Screenshot collection
 

@@ -58,6 +58,27 @@ struct ShelfView: View {
                 .font(.caption).monospacedDigit()
                 .foregroundStyle(.secondary)
             Spacer()
+            Menu {
+                ForEach(Shelf.retentionPresets, id: \.self) { days in
+                    Toggle(Shelf.retentionTitle(days), isOn: Binding(
+                        get: { shelf.retentionDays == days },
+                        set: { if $0 { shelf.retentionDays = days } }))
+                }
+                Divider()
+                Button(Shelf.retentionPresets.contains(shelf.retentionDays) || shelf.retentionDays == 0
+                       ? "自定义…" : "自定义（\(shelf.retentionDays) 天）…") {
+                    shelf.promptCustomRetention()
+                }
+                Toggle("不自动清理", isOn: Binding(
+                    get: { shelf.retentionDays == 0 },
+                    set: { if $0 { shelf.retentionDays = 0 } }))
+            } label: {
+                Text(Shelf.retentionTitle(shelf.retentionDays))
+                    .font(.caption)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("超过天数的素材自动移到废纸篓")
             Button {
                 shelf.pasteFromClipboard()
             } label: {
@@ -92,7 +113,9 @@ struct ShelfView: View {
 
     private var footer: some View {
         HStack {
-            Toggle("自动收集新截图", isOn: $shelf.collectScreenshots)
+            Toggle("收集新截图", isOn: $shelf.collectScreenshots)
+                .toggleStyle(.checkbox)
+            Toggle("收集复制的图片和文件", isOn: $shelf.collectClipboard)
                 .toggleStyle(.checkbox)
             Spacer()
             Button("清空") { shelf.clear() }

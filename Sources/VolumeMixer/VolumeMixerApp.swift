@@ -28,6 +28,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private let shelf = Shelf()
     private let guardian = SecurityGuard()
     private let popover = NSPopover()
+    /// .transient only closes on outside clicks while 一览 is the active app, and macOS 14's
+    /// cooperative activation often leaves it inactive, so clicks in other apps are watched directly.
+    private var outsideClickMonitor: Any?
+    /// When 一览 is active, .transient closes the popover on mouse-down over the status item, so by
+    /// the time the click action fires it looks closed and would reopen it. Remember when it closed.
+    private var popoverClosedAt = Date.distantPast
     private var statusItem: NSStatusItem!
     private var cancellables = Set<AnyCancellable>()
     private var shownContent: MenuBarContent?
@@ -99,6 +105,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             awake.toggle() // Option-click: quick keep-awake on/off, like Amphetamine
         } else if popover.isShown {
             popover.performClose(nil)
+        } else if Date().timeIntervalSince(popoverClosedAt) < 0.4 {
+            // This very click already closed it.
         } else {
             // While something is flagged, the shield in the menu bar leads straight to the 安全 page.
             openPopover(tab: guardian.needsAttention ? .security : nil)
@@ -117,6 +125,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         popover.contentViewController = host
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         NSApp.activate()
+        if outsideClickMonitor == nil {
+            // Global monitors only see events going to other apps, so clicks inside the popover
+            // (and on our own status item, which toggles it) never land here.
+            outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+                MainActor.assumeIsolated { self?.popover.performClose(nil) }
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -124,7 +140,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     }
 
     func popoverDidClose(_ notification: Notification) {
+        popoverClosedAt = Date()
         popover.contentViewController = nil
+        if let monitor = outsideClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            outsideClickMonitor = nil
+        }
     }
 
     // MARK: Dropping onto the menu bar icon
@@ -238,6 +259,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         collect.target = self
         collect.state = shelf.collectScreenshots ? .on : .off
         sub.addItem(collect)
+        let clip = NSMenuItem(title: "收集复制的图片和文件", action: #selector(shelfToggleClipboard), keyEquivalent: "")
+        clip.target = self
+        clip.state = shelf.collectClipboard ? .on : .off
+        sub.addItem(clip)
+        sub.addItem(.separator())
+        let keep = NSMenuItem(title: "自动清理：" + Shelf.retentionTitle(shelf.retentionDays), action: nil, keyEquivalent: "")
+        let keepMenu = NSMenu()
+        for days in Shelf.retentionPresets + [0] {
+            let option = NSMenuItem(title: Shelf.retentionTitle(days), action: #selector(shelfSetRetention(_:)), keyEquivalent: "")
+            option.target = self
+            option.tag = days
+            option.state = shelf.retentionDays == days ? .on : .off
+            keepMenu.addItem(option)
+        }
+        let custom = NSMenuItem(title: "自定义…", action: #selector(shelfCustomRetention), keyEquivalent: "")
+        custom.target = self
+        if !(Shelf.retentionPresets + [0]).contains(shelf.retentionDays) {
+            custom.title = "自定义（\(shelf.retentionDays) 天）…"
+            custom.state = .on
+        }
+        keepMenu.addItem(.separator())
+        keepMenu.addItem(custom)
+        keep.submenu = keepMenu
+        sub.addItem(keep)
         item.submenu = sub
         return item
     }
@@ -246,6 +291,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     @objc private func shelfReveal() { NSWorkspace.shared.open(shelf.directory) }
     @objc private func shelfClear() { shelf.clear() }
     @objc private func shelfToggleCollect() { shelf.collectScreenshots.toggle() }
+    @objc private func shelfToggleClipboard() { shelf.collectClipboard.toggle() }
+    @objc private func shelfSetRetention(_ sender: NSMenuItem) { shelf.retentionDays = sender.tag }
+    @objc private func shelfCustomRetention() { shelf.promptCustomRetention() }
 
     @objc private func toggleLaunchAtLogin() {
         mixer.launchAtLogin.toggle()
